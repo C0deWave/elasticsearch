@@ -382,6 +382,14 @@ public class AllocationService {
             return null;
         }
 
+        final var nodeShutdowns = allocationSupplier.get().metadata().nodeShutdowns();
+        // RESTART retains its copies; REPLACE has separate allocation rules for its replacement target.
+        final Set<String> nodesToRemove = nodeShutdowns.getAll()
+            .values()
+            .stream()
+            .filter(shutdown -> shutdown.getType() == Type.REMOVE || shutdown.getType() == Type.SIGTERM)
+            .map(SingleNodeShutdownMetadata::getNodeId)
+            .collect(Collectors.toSet());
         final RoutingTable.Builder routingTableBuilder = RoutingTable.builder(shardRoutingRoleStrategy, projectRoutingTable);
         ProjectMetadata.Builder projectBuilder = ProjectMetadata.builder(project);
         for (Map.Entry<Integer, List<String>> entry : autoExpandReplicaChanges.entrySet()) {
@@ -389,7 +397,7 @@ public class AllocationService {
             final String[] indices = entry.getValue().toArray(Strings.EMPTY_ARRAY);
             // we do *not* update the in sync allocation ids as they will be removed upon the first index
             // operation which make these copies stale
-            routingTableBuilder.updateNumberOfReplicas(numberOfReplicas, indices);
+            routingTableBuilder.updateNumberOfReplicas(numberOfReplicas, indices, nodesToRemove);
             projectBuilder.updateNumberOfReplicas(numberOfReplicas, indices);
             // update settings version for each index
             for (final String index : indices) {

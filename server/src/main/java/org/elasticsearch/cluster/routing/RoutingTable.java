@@ -458,6 +458,13 @@ public class RoutingTable implements Iterable<IndexRoutingTable>, Diffable<Routi
          * @return the builder
          */
         public Builder updateNumberOfReplicas(final int numberOfReplicas, final String[] indices) {
+            return updateNumberOfReplicas(numberOfReplicas, indices, Set.of());
+        }
+
+        /**
+         * Update replica counts, preferring equally eligible replicas on departing nodes when reducing the count.
+         */
+        public Builder updateNumberOfReplicas(final int numberOfReplicas, final String[] indices, Set<String> nodesToRemove) {
             if (indicesRouting == null) {
                 throw new IllegalStateException("once build is called the builder cannot be reused");
             }
@@ -481,7 +488,7 @@ public class RoutingTable implements Iterable<IndexRoutingTable>, Diffable<Routi
                     }
                 } else if (currentNumberOfReplicas > numberOfReplicas) {
                     for (int i = 0; i < (currentNumberOfReplicas - numberOfReplicas); i++) {
-                        builder.removeReplica();
+                        builder.removeReplica(nodesToRemove);
                     }
                 }
                 indicesRouting.put(index, builder.build());

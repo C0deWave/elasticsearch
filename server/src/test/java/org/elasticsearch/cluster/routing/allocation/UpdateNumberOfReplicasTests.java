@@ -16,10 +16,15 @@ import org.elasticsearch.cluster.ESAllocationTestCase;
 import org.elasticsearch.cluster.TestShardRoutingRoleStrategies;
 import org.elasticsearch.cluster.metadata.IndexMetadata;
 import org.elasticsearch.cluster.metadata.Metadata;
+import org.elasticsearch.cluster.metadata.NodesShutdownMetadata;
+import org.elasticsearch.cluster.metadata.SingleNodeShutdownMetadata;
 import org.elasticsearch.cluster.node.DiscoveryNodes;
 import org.elasticsearch.cluster.routing.RoutingTable;
 import org.elasticsearch.common.settings.Settings;
+import org.elasticsearch.core.TimeValue;
 import org.elasticsearch.index.IndexVersion;
+
+import java.util.HashMap;
 
 import static org.elasticsearch.cluster.routing.ShardRoutingState.INITIALIZING;
 import static org.elasticsearch.cluster.routing.ShardRoutingState.STARTED;
@@ -30,6 +35,86 @@ import static org.hamcrest.Matchers.not;
 import static org.hamcrest.Matchers.nullValue;
 
 public class UpdateNumberOfReplicasTests extends ESAllocationTestCase {
+
+    public void testAutoExpandRetainsReplicasOnRemainingNodes() {
+        assertAutoExpandRetainsReplicasOnRemainingNodes(1);
+    }
+
+    public void testAutoExpandRetainsReplicasWhenRemovingMultipleNodes() {
+        assertAutoExpandRetainsReplicasOnRemainingNodes(between(2, 4));
+    }
+
+    private void assertAutoExpandRetainsReplicasOnRemainingNodes(int removingNodeCount) {
+        final var indexMetadata = IndexMetadata.builder("test")
+            .settings(indexSettings(IndexVersion.current(), 1, 0).put(IndexMetadata.SETTING_AUTO_EXPAND_REPLICAS, "0-all"))
+            .build();
+        final int nodeCount = removingNodeCount + between(2, 5);
+        final var nodes = DiscoveryNodes.builder();
+        for (int i = 0; i < nodeCount; i++) {
+            nodes.add(newNode("node-" + i));
+        }
+        final var allocationService = createAllocationService();
+        var state = ClusterState.builder(ClusterName.DEFAULT)
+            .nodes(nodes)
+            .metadata(Metadata.builder().put(indexMetadata, false))
+            .routingTable(RoutingTable.builder(TestShardRoutingRoleStrategies.DEFAULT_ROLE_ONLY).addAsNew(indexMetadata))
+            .build();
+        state = applyStartedShardsUntilNoChange(state, allocationService);
+        final var originalShards = state.routingTable().index("test").shard(0);
+        assertEquals(nodeCount, originalShards.size());
+        assertTrue(originalShards.allShardsStarted());
+
+        // Keep the first replica in routing order: removing it used to trigger an unnecessary recovery on its node.
+        final var shutdowns = new HashMap<String, SingleNodeShutdownMetadata>();
+        final var replicas = originalShards.replicaShards();
+        for (int i = replicas.size() - removingNodeCount; i < replicas.size(); i++) {
+            final var nodeId = replicas.get(i).currentNodeId();
+            final var type = randomFrom(SingleNodeShutdownMetadata.Type.REMOVE, SingleNodeShutdownMetadata.Type.SIGTERM);
+            shutdowns.put(
+                nodeId,
+                SingleNodeShutdownMetadata.builder()
+                    .setNodeId(nodeId)
+                    .setNodeEphemeralId(state.nodes().get(nodeId).getEphemeralId())
+                    .setType(type)
+                    .setReason("test")
+                    .setStartedAtMillis(1L)
+                    .setGracePeriod(type == SingleNodeShutdownMetadata.Type.SIGTERM ? TimeValue.timeValueMinutes(1) : null)
+                    .build()
+            );
+        }
+        // A restart must not cause the retained replica to be preferred for removal.
+        final var restartingNode = replicas.get(0).currentNodeId();
+        shutdowns.put(
+            restartingNode,
+            SingleNodeShutdownMetadata.builder()
+                .setNodeId(restartingNode)
+                .setNodeEphemeralId(state.nodes().get(restartingNode).getEphemeralId())
+                .setType(SingleNodeShutdownMetadata.Type.RESTART)
+                .setReason("test")
+                .setStartedAtMillis(1L)
+                .build()
+        );
+        final var shutdownMetadata = new NodesShutdownMetadata(shutdowns);
+        state = ClusterState.builder(state)
+            .metadata(Metadata.builder(state.metadata()).putCustom(NodesShutdownMetadata.TYPE, shutdownMetadata))
+            .build();
+        state = allocationService.reroute(state, "register node shutdown", ActionListener.noop());
+
+        assertEquals(nodeCount - removingNodeCount - 1, state.metadata().getProject().index("test").getNumberOfReplicas());
+        final var remainingShards = state.routingTable().index("test").shard(0);
+        assertTrue(remainingShards.toString(), remainingShards.allShardsStarted());
+        for (int i = 0; i < originalShards.size(); i++) {
+            final var originalShard = originalShards.shard(i);
+            final var currentShard = state.getRoutingNodes().node(originalShard.currentNodeId()).getByShardId(originalShard.shardId());
+            if (shutdownMetadata.isNodeMarkedForRemoval(originalShard.currentNodeId())) {
+                assertNull(currentShard);
+            } else {
+                assertNotNull(currentShard);
+                assertEquals(originalShard.allocationId(), currentShard.allocationId());
+                assertEquals(STARTED, currentShard.state());
+            }
+        }
+    }
 
     public void testUpdateNumberOfReplicas() {
         AllocationService strategy = createAllocationService(

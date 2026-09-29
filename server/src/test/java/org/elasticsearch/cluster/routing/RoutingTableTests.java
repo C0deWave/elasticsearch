@@ -529,6 +529,35 @@ public class RoutingTableTests extends ESAllocationTestCase {
         }
     }
 
+    public void testRemoveReplicasPrefersDepartingNodesWithinExistingPriorities() {
+        final var index = new Index("index", "uuid");
+        final var shardId = new ShardId(index, 0);
+        final var primary = TestShardRouting.newShardRouting(shardId, "primary-departing", true, STARTED);
+        final var removalOrder = List.of(
+            TestShardRouting.newShardRouting(shardId, "search-remaining", false, STARTED, ShardRouting.Role.SEARCH_ONLY),
+            TestShardRouting.newShardRouting(shardId, null, false, UNASSIGNED),
+            TestShardRouting.newShardRouting(shardId, "initializing-departing", false, INITIALIZING),
+            TestShardRouting.newShardRouting(shardId, "initializing-remaining", false, INITIALIZING),
+            TestShardRouting.newShardRouting(shardId, "started-departing", false, STARTED),
+            TestShardRouting.newShardRouting(shardId, "started-remaining", false, STARTED)
+        );
+        final var shards = new ArrayList<>(removalOrder);
+        shards.add(primary);
+        Randomness.shuffle(shards);
+        final var nodesToRemove = Set.of("primary-departing", "initializing-departing", "started-departing");
+        final var builder = new IndexRoutingTable.Builder(ShardRoutingRoleStrategy.NO_SHARD_CREATION, index);
+        for (var shard : shards) {
+            builder.addShard(shard);
+        }
+        for (int i = 0; i < removalOrder.size(); i++) {
+            final var remaining = builder.removeReplica(nodesToRemove).build().shard(0);
+            assertEquals(primary, remaining.primaryShard());
+            assertEquals(Set.copyOf(removalOrder.subList(i + 1, removalOrder.size())), Set.copyOf(remaining.replicaShards()));
+        }
+        // A primary on a departing node must still be handled by the allocator, never removed as a replica.
+        assertEquals(primary, builder.removeReplica(nodesToRemove).build().shard(0).primaryShard());
+    }
+
     public void testRoutingNodesRoundtrip() {
         final GlobalRoutingTable originalTable = clusterState.globalRoutingTable();
         final GlobalRoutingTable fromNodes = originalTable.rebuild(clusterState.getRoutingNodes(), clusterState.metadata());

@@ -659,6 +659,14 @@ public class IndexRoutingTable implements SimpleDiffable<IndexRoutingTable> {
         }
 
         public Builder removeReplica() {
+            return removeReplica(Set.of());
+        }
+
+        /**
+         * Prefer replicas on nodes being removed when their role and state have the same removal priority.
+         * This avoids discarding a usable copy on a remaining node only to recover it again during shutdown.
+         */
+        public Builder removeReplica(Set<String> nodesToRemove) {
             assert shards != null;
             for (int shardId = 0; shardId < shards.length; shardId++) {
                 IndexShardRoutingTable.Builder found = shards[shardId];
@@ -675,13 +683,23 @@ public class IndexRoutingTable implements SimpleDiffable<IndexRoutingTable> {
                     builder.addShard(shardRouting);
                 }
 
-                findAndRemove: for (Predicate<ShardRouting> removeClause : PRIORITY_REMOVE_CLAUSES) {
+                for (Predicate<ShardRouting> removeClause : PRIORITY_REMOVE_CLAUSES) {
+                    ShardRouting replicaToRemove = null;
                     for (int copy = 0; copy < indexShard.size(); copy++) {
                         ShardRouting shardRouting = indexShard.shard(copy);
                         if (shardRouting.primary() == false && removeClause.test(shardRouting)) {
-                            builder.removeShard(shardRouting);
-                            break findAndRemove;
+                            if (replicaToRemove == null) {
+                                replicaToRemove = shardRouting;
+                            }
+                            if (shardRouting.assignedToNode() && nodesToRemove.contains(shardRouting.currentNodeId())) {
+                                replicaToRemove = shardRouting;
+                                break;
+                            }
                         }
+                    }
+                    if (replicaToRemove != null) {
+                        builder.removeShard(replicaToRemove);
+                        break;
                     }
                 }
                 shards[shardId] = builder;
